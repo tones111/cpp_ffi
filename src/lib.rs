@@ -2,46 +2,27 @@
 
 use std::{
     ptr::NonNull,
-    sync::mpsc::{sync_channel, SyncSender},
+    sync::mpsc::{channel, sync_channel, Sender, SyncSender},
     thread::{self, JoinHandle},
 };
 
-//#[repr(C)]
-//struct Foo {
-//    _data: [u8; 0], // Private to prevent creation
-//    _marker: std::marker::PhantomData<(*mut u8, std::marker::PhantomPinned)>, // Prevent Send, Sync, Unpin
-//}
-
 struct Model {
     tx: Option<SyncSender<Request>>,
-    iot: Option<JoinHandle<u64>>,
+    iot: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
 enum Request {
-    JOB1,
-}
-
-impl Drop for Model {
-    fn drop(&mut self) {
-        println!("dropping Model");
-    }
+    JOB1(Sender<()>),
+    End(Sender<()>),
+    Stop,
 }
 
 #[no_mangle]
 unsafe extern "C" fn model__new() -> *mut Model {
-    let (tx, rx) = sync_channel(50);
     Box::into_raw(Box::new(Model {
-        tx: Some(tx),
-        iot: Some(thread::spawn(move || {
-            let mut cnt = 0;
-            for job in rx.iter() {
-                match job {
-                    Request::JOB1 => cnt += 1,
-                }
-            }
-            cnt
-        })),
+        tx: None,
+        iot: None,
     }))
 }
 
@@ -52,8 +33,49 @@ extern "C" fn model__drop(ptr: Option<NonNull<Model>>) {
 }
 
 #[no_mangle]
+unsafe extern "C" fn model__serve(ptr: Option<NonNull<Model>>) {
+    let mut ptr = ptr.unwrap();
+    let model = ptr.as_mut();
+
+    let (tx, rx) = sync_channel(50);
+    let mut iot_sender = Some(tx.clone());
+    model.tx = Some(tx);
+
+    model.iot = Some(thread::spawn(move || {
+        for job in rx.iter() {
+            match job {
+                Request::JOB1(tx) => {
+                    if let Some(iot_sender) = iot_sender.as_ref() {
+                        let _ = iot_sender.send(Request::End(tx));
+                    }
+                }
+                Request::End(tx) => {
+                    let _ = tx.send(());
+                }
+                Request::Stop => {
+                    iot_sender = None;
+                }
+            }
+        }
+    }));
+}
+
+#[no_mangle]
+unsafe extern "C" fn model__stop(ptr: Option<NonNull<Model>>) {
+    let mut ptr = ptr.unwrap();
+    let model = ptr.as_mut();
+
+    if let Some(tx) = model.tx.as_ref() {
+        let _ = tx.send(Request::Stop);
+    }
+    model.tx.take();
+    model.iot.take().unwrap().join().unwrap();
+}
+
+#[no_mangle]
 extern "C" fn model__new_sender(ptr: Option<NonNull<Model>>) -> *mut SyncSender<Request> {
-    let model = ptr.map(|ptr| unsafe { ptr.as_ref() }).unwrap();
+    let ptr = ptr.unwrap();
+    let model = unsafe { ptr.as_ref() };
     Box::into_raw(Box::new(model.tx.as_ref().unwrap().clone()))
 }
 
@@ -65,22 +87,17 @@ extern "C" fn sender__drop(ptr: Option<NonNull<SyncSender<Request>>>) {
 
 #[no_mangle]
 extern "C" fn sender__send_job(ptr: Option<NonNull<SyncSender<Request>>>) -> u8 {
+    let ptr = ptr.unwrap();
+    let sender = unsafe { ptr.as_ref() };
+
+    let (tx, rx) = channel();
     let mut status = 0;
-    if let Some(sender) = ptr.map(|ptr| unsafe { ptr.as_ref() }) {
-        match sender.send(Request::JOB1) {
-            Ok(()) => status = 1,
-            Err(e) => println!("send err: {:?}", e),
-        }
+    match sender.send(Request::JOB1(tx)) {
+        Ok(()) => match rx.recv() {
+            Ok(_) => status = 1,
+            Err(e) => println!("error receiving response {}", e),
+        },
+        Err(e) => println!("send err: {:?}", e),
     }
     status
-}
-
-#[no_mangle]
-unsafe extern "C" fn model__stop(ptr: Option<NonNull<Model>>) -> u64 {
-    let mut res = 0;
-    if let Some(model) = ptr.map(|mut ptr| unsafe { ptr.as_mut() }) {
-        model.tx.take();
-        res = model.iot.take().unwrap().join().unwrap_or_default();
-    }
-    res
 }
